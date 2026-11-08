@@ -1,0 +1,27 @@
+mode: standalone
+replicas: 1
+
+existingSecret: minio
+
+environment:
+  MINIO_BROWSER_REDIRECT_URL: http://minio.local
+
+consoleIngress:
+  enabled: true
+  ingressClassName: nginx
+  path: /
+  hosts:
+    - minio.local
+
+persistence:
+  enabled: true
+  size: 5Gi
+
+resources:
+  requests:
+    memory: 256Mi
+
+buckets:
+  - name: lakehouse
+    policy: none
+    purge: false

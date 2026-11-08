@@ -1,0 +1,77 @@
+env:
+  - name: "_PIP_ADDITIONAL_REQUIREMENTS"
+    value: "apache-airflow-providers-cncf-kubernetes"
+
+executor: "LocalExecutor"
+
+apiSecretKeySecretName: airflow-api-secret
+
+enableServiceLinks: false
+
+triggerer:
+  enabled: false
+
+ingress:
+  apiServer:
+    enabled: true
+    ingressClassName: nginx
+    hosts:
+      - name: airflow.local
+
+createUserJob:
+  env:
+    - name: AF_USER
+      valueFrom:
+        secretKeyRef:
+          name: airflow-admin
+          key: username
+    - name: AF_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: airflow-admin
+          key: password
+    - name: AF_EMAIL
+      valueFrom:
+        secretKeyRef:
+          name: airflow-admin
+          key: email
+  args:
+    - bash
+    - -c
+    - |
+      set -e
+      if airflow users list | grep -qE "(^| )${AF_USER}( |$)"; then
+        airflow users reset-password -u "$AF_USER" -p "$AF_PASSWORD"
+      else
+        airflow users create \
+          -r Admin -u "$AF_USER" -e "$AF_EMAIL" \
+          -f Admin -l User -p "$AF_PASSWORD"
+      fi
+
+dags:
+  gitSync:
+    enabled: false
+    recommendedProbeSetting: true
+
+x-dags-from-host: &dags-from-host
+  extraVolumes:
+    - name: dags-host-volume
+      hostPath:
+        path: "/mnt/airflow-dags"
+        type: Directory
+  extraVolumeMounts:
+    - name: dags-host-volume
+      mountPath: /opt/airflow/dags
+      readOnly: true
+  securityContext:
+    fsGroup: 50000
+
+
+scheduler:
+  <<: *dags-from-host
+
+webserver:
+  <<: *dags-from-host
+
+dagProcessor:
+  <<: *dags-from-host

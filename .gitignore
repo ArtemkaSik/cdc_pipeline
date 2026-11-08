@@ -1,0 +1,10 @@
+.env
+k8s/airflow/secrets.yaml
+.idea/
+k8s/airflow/secrets.yaml
+k8s/airflow/spark-secrets.yaml
+k8s/databases/postgres-secrets.yaml
+k8s/databases/mysql-secrets.yaml
+k8s/s3/secrets.yaml
+k8s/trino/
+__pycache__/

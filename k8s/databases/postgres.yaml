@@ -1,0 +1,230 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init-scripts
+  namespace: databases
+data:
+  init.sql: |
+    -- Инициализация таблиц
+    CREATE TABLE clients(
+      client_id BIGSERIAL PRIMARY KEY,
+      full_name VARCHAR(512) NOT NULL,
+      email VARCHAR(254),
+      phone VARCHAR(20),
+      birth_date DATE,
+      employer TEXT
+    );
+    
+    CREATE TABLE cards(
+      client_id BIGINT NOT NULL REFERENCES clients(client_id) ON DELETE CASCADE,
+      card_number VARCHAR(19) UNIQUE NOT NULL PRIMARY KEY,
+      card_type VARCHAR(50),
+      card_issue_date DATE,
+      card_expiry_date DATE
+    );
+      
+    CREATE TABLE operation(
+      operation_id BIGSERIAL PRIMARY KEY,
+      operation_name VARCHAR(50) NOT NULL UNIQUE
+    );
+    
+    CREATE TABLE transactions(
+      transaction_id BIGSERIAL PRIMARY KEY,
+      card_number VARCHAR(19) NOT NULL REFERENCES cards(card_number) ON DELETE CASCADE,
+      transaction_date TIMESTAMP NOT NULL,
+      amount NUMERIC(15, 2) NOT NULL,
+      operation_id BIGINT NOT NULL REFERENCES operation(operation_id)
+    );
+    
+    INSERT INTO operation (operation_name)
+    VALUES ('пополнение'), ('покупка'), ('снятие налички'), ('внесение налички на карту');
+    
+    -- Настройки для Debezium
+    CREATE USER debezium_user WITH REPLICATION LOGIN PASSWORD 'debezium_secure_password';
+    
+    GRANT SELECT ON ALL TABLES IN SCHEMA public TO debezium_user;
+    GRANT USAGE ON SCHEMA public TO debezium_user;
+    
+    CREATE PUBLICATION dbz_publication FOR ALL TABLES;
+    
+    -- Добавление процедуры и инициализация БД
+    
+    CREATE OR REPLACE PROCEDURE generate_data(
+        p_client_count INT,
+        p_card_count INT,
+        p_transaction_count INT
+    )
+    LANGUAGE plpgsql AS $$
+    DECLARE
+        v_operation_id_popolnenie BIGINT;
+        v_operation_id_pokupka BIGINT;
+        v_op_vnesenie BIGINT;
+        v_op_snyatie BIGINT;
+        v_bigint BIGINT;
+    BEGIN
+        -- 1. Получаем ID операций
+        SELECT operation_id INTO v_operation_id_popolnenie FROM operation WHERE operation_name = 'пополнение';
+        SELECT operation_id INTO v_operation_id_pokupka FROM operation WHERE operation_name = 'покупка';
+        SELECT operation_id INTO v_op_vnesenie FROM operation WHERE operation_name = 'внесение налички на карту';
+        SELECT operation_id INTO v_op_snyatie FROM operation WHERE operation_name = 'снятие налички';
+
+        RAISE NOTICE 'Генерация клиентов (% шт)...', p_client_count;
+        INSERT INTO clients (full_name, email, phone, birth_date, employer)
+        SELECT
+            'Клиент ' || substring(md5(random()::text) from 1 for 8),
+            'user_' || i || '@example.com',
+            '+7' || (1000000000 + (random() * 899999999)::bigint)::text,
+            CURRENT_DATE - ('18 years'::interval + random() * '50 years'::interval),
+            'Компания ' || substring(md5(random()::text) from 1 for 6)
+        FROM generate_series(1, p_client_count) AS i;
+
+        RAISE NOTICE 'Генерация карт (% шт)...', p_card_count;
+        SELECT coalesce(MAX(card_number::BIGINT), 0) INTO v_bigint FROM cards;
+
+        INSERT INTO cards(card_number, client_id, card_type, card_issue_date, card_expiry_date)
+        SELECT
+            (v_bigint + i)::text,
+            1 + floor(random() * p_client_count)::int,
+            (ARRAY['Visa', 'MasterCard', 'Mir'])[floor(random()*3) + 1],
+            CURRENT_DATE - (random() * '3 years'::interval),
+            CURRENT_DATE + (random() * '3 years'::interval)
+        FROM generate_series(1, p_card_count) AS i;
+
+        RAISE NOTICE 'Генерация транзакций (% шт)...', p_transaction_count;
+    
+        -- 2. ОПТИМИЗИРОВАННАЯ МАССОВАЯ ВСТАВКА (вместо цикла FOR)
+        -- Мы генерируем все транзакции одним запросом, что в 100-1000 раз быстрее
+        WITH random_cards AS (
+            -- Берем случайные карты для генерации транзакций
+            SELECT card_number, card_expiry_date 
+            FROM cards 
+            ORDER BY random() 
+            LIMIT p_transaction_count
+        ),
+        generated_tx AS (
+            SELECT 
+                card_number,
+                card_expiry_date,
+                (NOW() - (random() * '2 years'::interval)) AS tx_date,
+                (random() * 9990 + 10)::numeric(15, 2) AS base_amount,
+                random() AS rand_op
+            FROM random_cards
+        )
+        INSERT INTO transactions (card_number, transaction_date, amount, operation_id)
+        SELECT 
+            card_number,
+            tx_date,
+            CASE 
+                -- 80% шанс на списание (покупка или снятие), 20% на пополнение
+                WHEN rand_op < 0.80 THEN -base_amount 
+                ELSE base_amount 
+            END AS amount,
+            CASE 
+                WHEN rand_op < 0.30 THEN v_operation_id_popolnenie
+                WHEN rand_op < 0.40 THEN v_op_vnesenie
+                WHEN rand_op < 0.80 THEN v_operation_id_pokupka
+                ELSE v_op_snyatie
+            END AS operation_id
+        FROM generated_tx
+        -- Фильтруем транзакции, дата которых позже срока действия карты
+        WHERE tx_date <= card_expiry_date;
+
+        RAISE NOTICE 'Генерация успешно завершена!';
+    
+        -- 3. Вывод статистики (одним быстрым запросом)
+        RAISE NOTICE 'Всего клиентов: %', (SELECT count(*) FROM clients);
+        RAISE NOTICE 'Всего карт: %', (SELECT count(*) FROM cards);
+        RAISE NOTICE 'Всего транзакций: %', (SELECT count(*) FROM transactions);
+        RAISE NOTICE 'Транзакций с отрицательной суммой: %', (SELECT count(*) FROM transactions WHERE amount < 0);
+    END;
+    $$;
+    
+    CALL generate_data(500000, 1000000, 2000000)
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgresql
+  namespace: databases
+spec:
+  serviceName: postgresql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgresql
+  template:
+    metadata:
+      labels:
+        app: postgresql
+    spec:
+      containers:
+        - name: postgresql
+          image: postgres:16-alpine
+          args:
+            - "-c"
+            - "wal_level=logical"
+            - "-c"
+            - "max_replication_slots=4"
+            - "-c"
+            - "max_wal_senders=4"
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: dbname
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: password
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+            - name: init-scripts
+              mountPath: /docker-entrypoint-initdb.d
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 250m
+            limits:
+              memory: 512Mi
+              cpu: 500m
+      volumes:
+        # ConfigMap остается здесь, так как он не является уникальным для каждой реплики
+        - name: init-scripts
+          configMap:
+            name: postgres-init-scripts
+
+  # А вот PVC теперь создается автоматически через шаблон
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 5Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgresql
+  namespace: databases
+spec:
+  selector:
+    app: postgresql
+  ports:
+    - port: 5432
+      targetPort: 5432
+  type: ClusterIP
